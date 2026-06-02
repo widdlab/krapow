@@ -65,7 +65,7 @@ func initLinuxCmd() *cobra.Command {
 		Aliases: []string{"lin"},
 		Short:   "Launch a Linux runner (Ubuntu via Incus on Linux hosts; Ubuntu ARM via Tart on macOS hosts)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runInit(linuxKind, name, labels, repo, org, isolation, plain)
+			return runInit(linuxKind, name, labels, repo, org, isolation, plain, 0)
 		},
 	}
 	addScopeFlags(c, &repo, &org)
@@ -87,7 +87,7 @@ func initMacCmd() *cobra.Command {
 			if runtime.GOOS != "darwin" {
 				return fmt.Errorf("`krapow init mac` requires a macOS host (Tart wraps Apple's Virtualization.framework); current GOOS=%s", runtime.GOOS)
 			}
-			return runInit(macKind, name, labels, repo, org, isolation, plain)
+			return runInit(macKind, name, labels, repo, org, isolation, plain, 0)
 		},
 	}
 	addScopeFlags(c, &repo, &org)
@@ -101,12 +101,13 @@ func initMacCmd() *cobra.Command {
 func initWinCmd() *cobra.Command {
 	var name, labels, repo, org, isolation string
 	var yesBuild, plain bool
+	var diskGiB int
 	c := &cobra.Command{
 		Use:     "win",
 		Aliases: []string{"windows"},
 		Short:   "Launch a Windows Incus VM as a runner (auto-bakes base image on first run)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runInitWin(name, labels, repo, org, isolation, yesBuild, plain)
+			return runInitWin(name, labels, repo, org, isolation, yesBuild, plain, diskGiB)
 		},
 	}
 	addScopeFlags(c, &repo, &org)
@@ -115,6 +116,7 @@ func initWinCmd() *cobra.Command {
 	c.Flags().StringVar(&isolation, "isolation", "", "isolation mechanism (windows is vm-only)")
 	c.Flags().BoolVarP(&yesBuild, "yes", "y", false, "skip the confirmation prompt before kicking off a base-image build")
 	c.Flags().BoolVar(&plain, "plain", false, "disable the interactive TUI and print plain status lines")
+	c.Flags().IntVar(&diskGiB, "disk", winDefaultDiskGiB, fmt.Sprintf("root disk size in GiB (min %d — matches the bake image floor; C: is grown to fill the disk on first boot)", winMinDiskGiB))
 	return c
 }
 
@@ -245,6 +247,15 @@ var (
 	linuxARMImage = envOr("KRAPOW_LINUX_ARM_IMAGE", "ghcr.io/cirruslabs/ubuntu-runner-arm64:24.04")
 )
 
+// winMinDiskGiB is the floor for --disk on `init win`. The bake VM publishes a
+// 60 GiB image, and Incus refuses to clone into a smaller volume ("Source image
+// size exceeds specified volume size"). winDefaultDiskGiB matches that floor to
+// preserve historical behavior when --disk is omitted.
+const (
+	winMinDiskGiB     = 60
+	winDefaultDiskGiB = 60
+)
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -252,7 +263,10 @@ func envOr(k, def string) string {
 	return def
 }
 
-func runInitWin(name, labels, repo, org, isolation string, yesBuild, plain bool) error {
+func runInitWin(name, labels, repo, org, isolation string, yesBuild, plain bool, diskGiB int) error {
+	if diskGiB < winMinDiskGiB {
+		return fmt.Errorf("--disk %d is below the minimum of %d GiB (the bake image is %d GiB and Incus refuses to clone into a smaller volume)", diskGiB, winMinDiskGiB, winMinDiskGiB)
+	}
 	exists, err := incus.ImageExists(windowsImage)
 	if err != nil {
 		return err
@@ -271,7 +285,7 @@ func runInitWin(name, labels, repo, org, isolation string, yesBuild, plain bool)
 			return err
 		}
 	}
-	return runInit(windowsKind, name, labels, repo, org, isolation, plain)
+	return runInit(windowsKind, name, labels, repo, org, isolation, plain, diskGiB)
 }
 
 func readYes() bool {
@@ -296,9 +310,10 @@ type initContext struct {
 	isolation string // resolved isolation: "vm" today; "host"/"container" land in later phases
 	regToken  string
 	vmIP      string // populated by Windows ssh phase
+	diskGiB   int    // root disk size in GiB; only consulted on the windows path (0 elsewhere)
 }
 
-func runInit(k kind, name, labels, repoFlag, orgFlag, isolationFlag string, plain bool) error {
+func runInit(k kind, name, labels, repoFlag, orgFlag, isolationFlag string, plain bool, diskGiB int) error {
 	owner, scope, target, err := resolveScope(repoFlag, orgFlag)
 	if err != nil {
 		return err
@@ -334,6 +349,7 @@ func runInit(k kind, name, labels, repoFlag, orgFlag, isolationFlag string, plai
 		target:    target,
 		ownerURL:  "https://github.com/" + owner,
 		isolation: isolation,
+		diskGiB:   diskGiB,
 	}
 
 	phases := phasesFor(k, ic.isolation)
@@ -756,16 +772,18 @@ func waitForTartSSH(r *tui.Runner, name string, timeout time.Duration) (string, 
 
 func doInitWindows(r *tui.Runner, ic *initContext, vars provision.Vars) error {
 	r.Start("boot")
+	rootSize := fmt.Sprintf("%dGiB", ic.diskGiB)
 	r.Log("incus launch %s %s --vm", windowsImage, ic.name)
-	r.Log("  cpus=4  memory=8GiB  root=60GiB")
-	// Must be >= the published base image's disk size (60 GiB — set in the
-	// bake VM). Cloning into a smaller volume fails with "Source image size
-	// exceeds specified volume size".
+	r.Log("  cpus=4  memory=8GiB  root=%s", rootSize)
+	// root.size must be >= the published base image's disk size (60 GiB — set
+	// in the bake VM). Cloning into a smaller volume fails with "Source image
+	// size exceeds specified volume size". The floor is enforced in
+	// runInitWin so a bad --disk is rejected before we get here.
 	err := incus.LaunchVM(windowsImage, ic.name, map[string]string{
 		"security.secureboot": "false",
 		"limits.cpu":          "4",
 		"limits.memory":       "8GiB",
-	}, map[string]string{"root.size": "60GiB"})
+	}, map[string]string{"root.size": rootSize})
 	if err == nil {
 		r.Log("VM started; writing state file")
 		err = state.Save(state.Runner{
